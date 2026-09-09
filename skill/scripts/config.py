@@ -4,6 +4,12 @@
 配置存于 ``~/.llmfill/config.json``（权限 600）。
 环境变量 ``LLMFILL_BASE_URL`` / ``LLMFILL_API_KEY`` 优先级高于配置文件，
 便于 CI 或临时覆盖而不落盘。
+
+安全模型（对应审计 T09：未校验/未批准的凭据与文档外发目的地）：
+- base_url 默认仅允许 ``https://www.llmfill.com``（含裸域 llmfill.com）；
+- 自定义 origin（自建/代理）必须显式批准：交互确认或 ``config --allow-custom``，
+  批准结果持久化到 ``approved_origins``，之后每次调用 fail-closed 校验；
+- 明文 HTTP 默认拒绝，仅 ``LLMFILL_ALLOW_INSECURE_HTTP=1`` 显式放行（本地开发/测试）。
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import urllib.parse
 from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".llmfill"
@@ -19,11 +26,84 @@ ENDPOINTS_PATH = CONFIG_DIR / "endpoints.json"
 
 DEFAULT_BASE_URL = "https://www.llmfill.com"
 
-_VALID_KEYS = {"base_url", "api_key", "user_id", "default_kb", "created_at"}
+# 默认信任的服务 origin（www 与裸域等价）；其它 host 视为「自建/代理」需显式批准
+ALLOWED_HOSTS = ("www.llmfill.com", "llmfill.com")
+
+# 显式开关：允许明文 HTTP（仅本地开发/测试），默认关闭。设 1/true/yes 生效。
+ALLOW_INSECURE_HTTP_ENV = "LLMFILL_ALLOW_INSECURE_HTTP"
+
+_VALID_KEYS = {
+    "base_url", "api_key", "user_id", "default_kb", "created_at",
+    # 用户显式批准的自定义 endpoint（精确 origin，规范化后的 scheme://host[:port]）
+    "approved_origins",
+}
 
 
 class ConfigError(Exception):
     """配置缺失或格式错误。"""
+
+
+def allow_insecure_http() -> bool:
+    """是否显式放行明文 HTTP（本地开发/测试开关，默认关闭）。"""
+    return os.environ.get(ALLOW_INSECURE_HTTP_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def validate_base_url(url: str, *, allow_insecure: bool = False) -> str:
+    """校验并规范化 base_url，返回标准化 origin（无尾斜杠）。
+
+    安全约束：
+    - 默认仅允许 https；明文 http 仅在 ``allow_insecure=True``（本地开发/测试）时放行；
+    - 拒绝内嵌用户名/密码、# 锚点、查询串、多余路径；
+    - 必须含主机名。
+    返回 ``<scheme>://host[:port]``，不带尾斜杠。
+    """
+    parts = urllib.parse.urlsplit(url or "")
+    scheme = parts.scheme
+    if scheme != "https" and not (allow_insecure and scheme == "http"):
+        raise ConfigError(
+            f"base_url 必须为 HTTPS（当前：{scheme or '空'}）。"
+            "拒绝明文 HTTP 或其它 scheme；确需本地明文 HTTP 请设 "
+            f"{ALLOW_INSECURE_HTTP_ENV}=1。"
+        )
+    if parts.username or parts.password:
+        raise ConfigError("base_url 不允许内嵌用户名/密码")
+    if parts.fragment:
+        raise ConfigError("base_url 不允许包含 # 锚点")
+    if parts.query:
+        raise ConfigError("base_url 不允许包含查询串")
+    if parts.path not in ("", "/"):
+        raise ConfigError(
+            "base_url 应只填 origin（如 https://www.llmfill.com），不要带路径"
+        )
+    host = parts.hostname
+    if not host:
+        raise ConfigError("base_url 缺少主机名")
+    return f"{scheme}://{host}" + (f":{parts.port}" if parts.port else "")
+
+
+def is_default_base(url: str) -> bool:
+    """base_url 是否指向默认信任 origin（www.llmfill.com / llmfill.com）。"""
+    return (urllib.parse.urlsplit(url).hostname or "") in ALLOWED_HOSTS
+
+
+def ensure_allowed_base(cfg: dict) -> None:
+    """fail-closed：非默认 origin 必须已在 approved_origins 里显式批准，否则抛错。
+
+    单独改 ``base_url`` 字段、或设 ``LLMFILL_BASE_URL``，不能绕过批准——
+    只有 ``config --allow-custom``（或交互确认）能把 origin 写进 approved_origins。
+    """
+    base = cfg.get("base_url") or DEFAULT_BASE_URL
+    if is_default_base(base):
+        return
+    approved = set(cfg.get("approved_origins") or [])
+    if base in approved:
+        return
+    raise ConfigError(
+        f"自定义服务端点 {base} 未获批准。默认仅允许 https://www.llmfill.com。\n"
+        "如确需自建/代理部署，请运行：\n"
+        f"  python scripts/llmfill.py config --base {base} --allow-custom\n"
+        "（或交互式 config 时确认），批准会持久化到 config.json 的 approved_origins。"
+    )
 
 
 def _tighten_perms(path: Path) -> None:
@@ -34,10 +114,11 @@ def _tighten_perms(path: Path) -> None:
         pass
 
 
-def load_config(*, require: bool = True) -> dict:
+def load_config(*, require: bool = True, check_approval: bool = True) -> dict:
     """读取配置；环境变量覆盖 base_url / api_key。
 
     require=True 且无 api_key 时抛 ConfigError（提示先运行 config）。
+    check_approval=False 供 cmd_config 使用（配置阶段自行处理批准，避免旧值误伤）。
     """
     cfg: dict = {}
     if CONFIG_PATH.exists():
@@ -56,6 +137,9 @@ def load_config(*, require: bool = True) -> dict:
         cfg["api_key"] = env_key
 
     cfg.setdefault("base_url", DEFAULT_BASE_URL)
+    cfg["base_url"] = validate_base_url(cfg["base_url"], allow_insecure=allow_insecure_http())
+    if check_approval:
+        ensure_allowed_base(cfg)
 
     if require and not cfg.get("api_key"):
         raise ConfigError(

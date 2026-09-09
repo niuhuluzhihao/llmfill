@@ -1,27 +1,62 @@
 ---
 name: llmfill
 description: |
-  调用 LLMFill（llmfill.com）远程服务，用 AI 自动填写 Word 文档中的
-  表单/问卷/清单等，并管理供填写时检索的知识库。当用户要求"AI 填表/
-  自动作答/批量填写 .docx"、"建知识库/上传参考资料"、"查余额或验证
-  API 令牌"时使用。核心能力：上传 .docx -> 异步填写（自动轮询）-> 下载
-  带颜色标注或纯净版结果；答案来源可选知识库/联网/混合/纯大模型。
-  首次使用需在 https://www.llmfill.com/profile 「API 密钥」生成 aif_
-  开头的令牌；无 Python 环境时可用 curl 等价调用（见 curl-guide.md）。
-  不提供直接检索接口 -- 知识库通过 fill --kb 挂载使用。
+  AI Word form filling — auto-fill any .docx form, questionnaire, survey, or template using reference documents, a knowledge base, or web search. Complete DDQs, due diligence questionnaires, compliance forms, applications, and checklists automatically. Built for document automation and batch form completion.
 ---
 
 # LLMFill Skill
 
 ## 何时使用
 
-- 用户给 .docx 模板，要求"AI 填一下""自动作答""批量填表" -> `fill`
-- 用户要"建知识库""把资料传上去给 AI 用" -> `kb create` / `kb upload`
-- 用户要"查余额/令牌是否有效" -> `whoami`
-- 需要了解服务当前有哪些可用接口 -> `discover`
+当用户需要 **AI 自动填写 Word 文档 (.docx) 中的表单、问卷、清单、模板**，
+且答案需要从参考资料、知识库或联网搜索中提取时，使用本 skill。
 
-注：本 skill 不提供直接检索（search）--检索是服务端填写链路的内部行为，
-知识库通过 `fill --kb` 挂载使用。
+**触发场景（出现以下说法即适用）：**
+
+中文：
+- "帮我填一下这个 Word 文档 / 把这个 docx 填了"
+- "根据这份资料填写模板 / 照着 A 文档填 B 文档"
+- "尽职调查问卷 / DDQ 填写"
+- "合规问卷 / 调查表 / 申请表 自动填写"
+- "批量填表 / 自动作答 / AI 填表"
+- "建个知识库 / 把这些资料上传给 AI 用"
+- "用知识库回答问题 / 基于资料答题"
+
+English:
+- "Fill out this Word form / questionnaire / checklist"
+- "Auto-fill this docx template using reference documents"
+- "Complete a DDQ / due diligence questionnaire"
+- "Fill forms from a knowledge base"
+- "AI form filling / document auto-completion"
+- "Batch fill multiple Word documents"
+- "Extract answers from PDFs and fill Word forms"
+- "Build a knowledge base for answering forms"
+
+**不适用场景：**
+- 简单的 `{{占位符}}` 文本替换
+- 纯本地处理、不允许文档上传到第三方服务的场景
+
+**核心命令映射：**
+- 填写文档 -> `fill`
+- 建知识库 -> `kb create` + `kb upload`
+- 查余额/令牌状态 -> `whoami`
+- 接口发现 -> `discover`
+
+
+## 安全与数据处理
+
+**必读：本 skill 会将用户文档上传至 LLMFill 远程服务 (llmfill.com)。**
+
+- **数据上传提示**：执行 `fill`、`kb upload` 等上传命令前，如文档包含机密、受监管或内部敏感信息，必须先确认用户同意将该文档发送到 llmfill.com 服务器处理。
+- **API 凭证管理**：API 令牌（`aif_` 开头）为长效凭证，必须安全存储。
+  - 推荐使用  `secrets` 工具存储令牌（名称：`LLMFILL_API_TOKEN`，允许主机：`www.llmfill.com`）
+  - 配置文件位于 `~/.llmfill/config.json`，权限自动设为 600（仅所有者读写）
+  - 令牌泄露时立即到 https://www.llmfill.com/profile 删除并重建
+- **服务端点**：默认锁定 `https://www.llmfill.com`。改用自定义地址（自建/代理）须
+  `config --base <url> --allow-custom`（或交互式确认）显式批准，批准绑定到精确
+  origin 并持久化；必须为 HTTPS（本地明文 HTTP 测试需设 `LLMFILL_ALLOW_INSECURE_HTTP=1`）。
+- **知识库删除**：执行 `kb rm` 前确认目标知识库 ID，删除不可恢复；命令内置确认（交互环境需输入 y，非交互环境必须带 `--yes`）。
+- **结果校验**：AI 生成的填写内容可能有误差，正式使用前请人工复核。
 
 ## 首次配置（必须）
 
@@ -39,19 +74,25 @@ python --version 2>/dev/null || python3 --version 2>/dev/null
 
 CLI 方式（只填 Key，服务地址已内置）：
 
+方式一：交互式配置（会提示粘贴令牌）
 ```bash
 python scripts/llmfill.py config
 # 按提示粘贴 aif_ 开头的令牌即可；完成后自动自检并显示余额
 # 也可带参数：python scripts/llmfill.py config --token aif_xxx
 ```
 
+方式二：从环境变量读取（推荐，避免令牌出现在命令行历史）
+python scripts/llmfill.py config --token-env LLMFILL_API_TOKEN
+
 令牌获取：引导用户去 https://www.llmfill.com/profile 注册登录 ->「API 密钥」
 -> 创建令牌 -> 复制 `aif_` 开头字符串（忘记可随时点"查看令牌"再次获取，令牌永久不变）。
 
 配置存于 `~/.llmfill/config.json`（权限 600）。**服务地址默认内置
-`https://www.llmfill.com`，无需输入**；自建/代理部署时可直接编辑该 JSON
-的 `base_url` 字段（或 `config --base`、环境变量 `LLMFILL_BASE_URL`），
-修改后所有命令即用新地址。
+`https://www.llmfill.com`，无需输入**；自建/代理部署改用 `--base` 指定自定义
+地址，并加 `--allow-custom` 显式批准（或交互式确认），批准结果持久化到
+`approved_origins`。直接编辑 `base_url` 字段、或只设 `LLMFILL_BASE_URL` 不会
+生效（fail-closed，防令牌/文档被静默发往第三方）。本地明文 HTTP 测试需设
+`LLMFILL_ALLOW_INSECURE_HTTP=1`。
 
 注意：注册新用户（邮箱验证/微信绑定）必须在网页完成，无法通过本 skill 注册。
 
@@ -72,7 +113,7 @@ python scripts/llmfill.py kb ls                               # 列出
 python scripts/llmfill.py kb create --name "公司资料" --desc "..."
 python scripts/llmfill.py kb upload kb-xxx 资料.pdf 手册.docx  # 入库（自动轮询）
 python scripts/llmfill.py kb docs kb-xxx                      # 列文档（含入库状态）
-python scripts/llmfill.py kb rm kb-xxx                        # 删除
+python scripts/llmfill.py kb rm kb-xxx --yes                  # 删除（不可恢复，非交互须 --yes）
 
 # 账号
 python scripts/llmfill.py whoami                              # 令牌自检 + 余额

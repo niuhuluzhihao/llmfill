@@ -4,6 +4,12 @@
 > 完成全部功能（curl 在 Windows 10+/Linux/macOS 均自带）。有 Python 时
 > 优先用 `scripts/llmfill.py`（自动轮询/下载/错误解析，体验更好）。
 
+> ⚠️ **隐私与数据外发**：以下所有操作都会把**文档内容 + 你的 API 令牌**
+> 发送到 `https://www.llmfill.com` 远程服务器处理/存储。上传前请确认你有权
+> 外发这些内容；**不要上传**机密、个人敏感数据、受监管或仅限内网的文档。
+> 令牌为明文长效凭证，请勿写进 shell 历史、截图、备份或代码仓库；泄露后立即到
+> 个人中心删除重建。
+
 ## 环境约定
 
 - 服务地址（BASE）：`https://www.llmfill.com`（内置默认；自建部署改这里）
@@ -17,10 +23,12 @@
 ## 第一步：配置令牌（手工建配置文件，供后续会话复用）
 
 ```bash
-mkdir -p ~/.llmfill
+umask 077                       # 本次会话新建文件默认不对外
+install -d -m 700 ~/.llmfill    # 目录仅本人可进
 cat > ~/.llmfill/config.json <<'EOF'
 {"base_url": "https://www.llmfill.com", "api_key": "aif_你的令牌"}
 EOF
+chmod 600 ~/.llmfill/config.json   # 明文凭据文件仅本人可读写
 ```
 
 令牌获取：浏览器打开 https://www.llmfill.com 注册登录 -> 个人中心「API 密钥」

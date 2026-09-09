@@ -34,6 +34,41 @@ class ApiError(Exception):
         self.status = status
 
 
+def _origin(url: str) -> str:
+    """规范化 origin：``scheme://host[:port]``，端口缺省按 scheme 补默认。"""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    port = parts.port
+    if port is None:
+        port = 443 if parts.scheme == "https" else 80
+    return f"{parts.scheme}://{host}:{port}"
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """仅允许同 origin 重定向；跨域/降级一律拒绝，防 X-Auth-Token 泄露到第三方。
+
+    urllib 默认会把原请求头（含 X-Auth-Token）转发到重定向目标，跨域即泄露凭据。
+    此处比较规范化 origin，不同则抛 HTTPError 终止，绝不转发认证头。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = _origin(req.full_url)
+        new = _origin(newurl)
+        if old != new:
+            raise urllib.error.HTTPError(
+                req.full_url, code,
+                f"拒绝跨域重定向：{old} -> {new}（不转发认证头）",
+                headers, fp,
+            )
+        # 同 origin：沿用标准行为（POST 301/302/303 会转 GET 丢弃 multipart body，
+        # 307/308 的 POST 不重定向；https->http 降级已被 origin 比较拦截）
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# 全局 opener：用「仅同源重定向」handler 替换 urllib 默认的跨域跟随
+_opener = urllib.request.build_opener(_SameOriginRedirectHandler())
+
+
 def _headers_with_auth(api_key: str, extra: dict | None = None) -> dict:
     headers = {"X-Auth-Token": api_key, "Accept": "application/json"}
     if extra:
@@ -95,7 +130,7 @@ def request_json(
 
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener.open(req, timeout=timeout) as resp:
             raw = resp.read()
             if not raw:
                 return {}
@@ -165,6 +200,23 @@ def _ascii_fallback_filename(name: str) -> str:
         return "file"
 
 
+def _safe_filename(name: str) -> str:
+    """把服务端返回的文件名当作不可信输入：仅取 basename，拒绝路径分隔符/盘符/.. 与控制字符。
+
+    服务端（或中间人）可通过 Content-Disposition 控制文件名；直接 ``out_dir / name``
+    会被 ``../../`` 或绝对路径穿越到 out_dir 之外。此处统一分隔符后取末段，再剥控制字符。
+    """
+    # 统一分隔符后取最后一段（POSIX "/" 与 Windows "\\" 均视为分隔符）
+    basename = name.replace("\\", "/").split("/")[-1].strip()
+    if basename in ("", ".", ".."):
+        return "download.bin"
+    # 去除控制字符与 DEL（避免换行/退格注入文件名）
+    cleaned = "".join(c for c in basename if ord(c) >= 32 and ord(c) != 0x7F)
+    if not cleaned:
+        return "download.bin"
+    return cleaned
+
+
 def download_file(
     base_url: str,
     api_key: str,
@@ -179,11 +231,17 @@ def download_file(
         url, headers=_headers_with_auth(api_key), method="GET"
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener.open(req, timeout=timeout) as resp:
             disp = resp.headers.get("Content-Disposition") or ""
-            filename = _filename_from_disposition(disp) or path.rstrip("/").split("/")[-1] or "download.bin"
+            raw_name = _filename_from_disposition(disp) or path.rstrip("/").split("/")[-1] or "download.bin"
+            filename = _safe_filename(raw_name)
             out_dir.mkdir(parents=True, exist_ok=True)
-            target = _unique_path(out_dir / filename)
+            root = out_dir.resolve()
+            target = (root / filename).resolve()
+            # 二次防护：确保最终路径仍落在 out_dir 内（防御 basename 未覆盖的边界）
+            if target.parent != root:
+                raise ApiError("UNSAFE_FILENAME", f"服务端返回了不安全文件名：{raw_name!r}")
+            target = _unique_path(target)
             # 流式写入，避免大文件一次性读入内存
             with open(target, "wb") as f:
                 shutil.copyfileobj(resp, f)

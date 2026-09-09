@@ -13,6 +13,11 @@
 - 无过期时间，可随时删除
 - 删除后立即失效
 
+> ⚠️ **令牌是高价值长效明文凭据**：永久有效、可反复查看，意味着一旦泄露
+> （本地文件、备份、截图、日志、shell 历史），攻击者可长期使用直到你手动删除。
+> 建议：不要写进 shell 历史/截图/代码仓库/备份；`~/.llmfill/config.json` 保持
+> 600 权限；多账号时用脱敏邮箱确认归属；泄露后立即到个人中心删除重建。
+
 ## 本地配置
 
 `~/.llmfill/config.json`（权限 600；`llmfill config` 只问 API Key，
@@ -26,8 +31,11 @@
 }
 ```
 
-改 `base_url` 字段后所有命令即用新地址（自建/代理部署场景）。
-环境变量 `LLMFILL_API_KEY` / `LLMFILL_BASE_URL` 优先于配置文件（CI 友好）。
+自建/代理部署时用 `config --base <url> --allow-custom` 显式批准自定义地址（批准
+持久化到 `approved_origins`，绑定精确 origin）。直接改 `base_url` 字段、或只设
+`LLMFILL_BASE_URL` 不会生效（fail-closed，防令牌被静默发往第三方）。
+环境变量 `LLMFILL_API_KEY` / `LLMFILL_BASE_URL` 优先于配置文件（CI 友好；
+`LLMFILL_BASE_URL` 须指向已批准的 origin）。
 
 无 Python 环境可手工创建此文件（curl 通道同样读取），见 `curl-guide.md`。
 

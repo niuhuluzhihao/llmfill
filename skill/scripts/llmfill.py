@@ -30,9 +30,12 @@ from pathlib import Path
 from config import (
     ConfigError,
     DEFAULT_BASE_URL,
+    allow_insecure_http,
+    is_default_base,
     load_config,
     save_config,
     save_endpoints,
+    validate_base_url,
 )
 from api_client import ApiError, download_file, poll_until_done, request_json
 
@@ -119,13 +122,45 @@ def _mk_api(cfg: dict):
 # ---------------------------------------------------------------------------
 
 
+def _approve_custom_base(cfg: dict, base_url: str, allow_custom: bool) -> None:
+    """自定义 origin 需显式批准：--allow-custom 或交互确认，并持久化 approved_origins。
+
+    非交互且未传 --allow-custom 时 fail-closed（警告不能代替同意）。
+    """
+    approved = set(cfg.get("approved_origins") or [])
+    if base_url in approved:
+        return  # 已批准，无需再确认
+    if allow_custom:
+        approved.add(base_url)
+        cfg["approved_origins"] = sorted(approved)
+        return
+    if sys.stdin.isatty():
+        print(f"警告：base_url 指向非默认端点 {base_url}（默认 {DEFAULT_BASE_URL}）。",
+              file=sys.stderr)
+        ans = input(f"  确认将令牌与文档发送到 {base_url} ？[y/N]: ").strip().lower()
+        if ans in ("y", "yes"):
+            approved.add(base_url)
+            cfg["approved_origins"] = sorted(approved)
+            return
+        raise ApiError("CANCELLED", "已取消：未确认自定义端点")
+    raise ApiError(
+        "CUSTOM_BASE_REQUIRES_APPROVAL",
+        f"自定义端点 {base_url} 需显式批准：请加 --allow-custom 或交互式确认",
+    )
+
+
 def cmd_config(args, out: Output) -> None:
     """首次配置：只填 API Key（base_url 内置默认，改 JSON/env 可覆盖）。"""
-    cfg = load_config(require=False)
+    cfg = load_config(require=False, check_approval=False)
 
     # base_url 不提示用户输入：默认内置，需要改的场景（自建/代理部署）
-    # 直接编辑 ~/.llmfill/config.json 的 base_url 字段或用 --base 参数。
-    base_url = args.base or cfg.get("base_url") or DEFAULT_BASE_URL
+    # 用 --base 参数（自定义 origin 需 --allow-custom 或交互确认）。
+    base_url = validate_base_url(
+        args.base or cfg.get("base_url") or DEFAULT_BASE_URL,
+        allow_insecure=allow_insecure_http(),
+    )
+    if not is_default_base(base_url):
+        _approve_custom_base(cfg, base_url, args.allow_custom)
     api_key = args.token or cfg.get("api_key") or ""
 
     if not args.token:
@@ -369,6 +404,17 @@ def cmd_kb(args, out: Output) -> None:
         return
 
     if args.kb_cmd == "rm":
+        # 删除不可恢复：交互环境需确认，非交互环境必须显式 --yes（防 agent 误删/注入误删）
+        if not args.yes:
+            if sys.stdin.isatty():
+                print(f"即将删除知识库 {args.kb_id}（不可恢复），确认？[y/N]: ", file=sys.stderr)
+                if input().strip().lower() not in ("y", "yes"):
+                    raise ApiError("CANCELLED", "已取消删除")
+            else:
+                raise ApiError(
+                    "CONFIRM_REQUIRED",
+                    f"删除知识库 {args.kb_id} 是不可恢复操作，请加 --yes 确认",
+                )
         data = api("DELETE", f"/v1/knowledge-bases/{args.kb_id}")
         out.result(data, ok=f"已删除知识库 {args.kb_id}")
         return
@@ -462,8 +508,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # config
     p = sub.add_parser("config", help="首次配置（API Key + Base URL）并自检")
-    p.add_argument("--base", help="覆盖服务地址（默认内置 www.llmfill.com；也可直接改 ~/.llmfill/config.json）")
+    p.add_argument("--base", help="覆盖服务地址（默认内置 www.llmfill.com；自定义地址需 --allow-custom）")
     p.add_argument("--token", help="API Key（aif_ 开头）")
+    p.add_argument("--allow-custom", action="store_true", help="批准非默认的自定义服务地址（自建/代理部署）")
     p.set_defaults(func=cmd_config)
 
     # whoami
@@ -505,8 +552,9 @@ def build_parser() -> argparse.ArgumentParser:
     q = kb_sub.add_parser("create", help="创建知识库")
     q.add_argument("--name", required=True)
     q.add_argument("--desc", default="")
-    q = kb_sub.add_parser("rm", help="删除知识库")
+    q = kb_sub.add_parser("rm", help="删除知识库（不可恢复）")
     q.add_argument("kb_id")
+    q.add_argument("--yes", action="store_true", help="跳过确认，直接删除")
     q = kb_sub.add_parser("docs", help="列出知识库下文档")
     q.add_argument("kb_id")
     q = kb_sub.add_parser("upload", help="上传文件到知识库（异步，自动轮询）")

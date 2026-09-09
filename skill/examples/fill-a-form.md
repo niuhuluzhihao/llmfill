@@ -3,13 +3,16 @@
 场景：用户说"帮我用 AI 填一下这份《供应商尽调问卷.docx》，答案尽量从我们的
 知识库里找"。
 
+> ⚠️ **隐私提示**：`fill` 会把 Word 文档内容 + 挂载的知识库内容上传到
+> `llmfill.com` 远程处理。上传前请确认有权外发这些内容；涉及机密、个人数据、
+> 受监管或内部文档时，先征得授权或先脱敏，不要直接上传。
+
 ## 1. 确认配置（首次）
 
 ```bash
 $ python scripts/llmfill.py config
-  API Base URL [https://www.llmfill.com]:          # 回车
   粘贴 aif_ 开头的令牌: aif_xxx…
-配置完成并验证通过：user_id=u-123，余额 8.8
+配置完成并验证通过：账号 j***@gmail.com，user_id=u-123，余额 8.8
 ```
 
 ## 2. （可选）先看有哪些知识库可用

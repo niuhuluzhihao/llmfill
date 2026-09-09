@@ -7,8 +7,13 @@
 ## 安装（SkillHub）
 
 ```bash
-npx clawhub install llmfill        # 或按所在平台的 skill 安装方式
+npx --yes clawhub@0.23.3 install llmfill@1.0.1    # 锁定已审计的安装器版本
 ```
+
+> 供应链说明：安装器锁定 `clawhub@0.23.3`、skill 锁定 `llmfill@1.0.2`（`--yes` 跳过
+> 首次安装的交互确认，适配 agent 非交互场景）。升级前请先核对新版本再更新版本号。
+> integrity（clawhub@0.23.3）：
+`sha512-VwM6FQrZVarFRDiEqG42npUeyCu/iLhPnpO+b7kKIGRXv+TA6Lb8pboHnIgT6cmjFEnW3j/pTbshWeDQMQ7QWQ==`
 
 ## 快速开始
 
