@@ -26,8 +26,9 @@ ENDPOINTS_PATH = CONFIG_DIR / "endpoints.json"
 
 DEFAULT_BASE_URL = "https://www.llmfill.com"
 
-# 默认信任的服务 origin（www 与裸域等价）；其它 host 视为「自建/代理」需显式批准
-ALLOWED_HOSTS = ("www.llmfill.com", "llmfill.com")
+# 默认信任的完整 origin（scheme+host+端口，默认端口省略）；其余一律视为
+# 「自建/代理」需显式批准——非默认端口即使 host 在名单内也不算默认信任
+DEFAULT_ALLOWED_ORIGINS = ("https://www.llmfill.com", "https://llmfill.com")
 
 # 显式开关：允许明文 HTTP（仅本地开发/测试），默认关闭。设 1/true/yes 生效。
 ALLOW_INSECURE_HTTP_ENV = "LLMFILL_ALLOW_INSECURE_HTTP"
@@ -81,9 +82,24 @@ def validate_base_url(url: str, *, allow_insecure: bool = False) -> str:
     return f"{scheme}://{host}" + (f":{parts.port}" if parts.port else "")
 
 
+def normalize_origin(url: str) -> str:
+    """规范化 origin：小写 host + 去默认端口，配置校验与重定向校验共用同一规则。
+
+    ``https://www.llmfill.com:443`` 与 ``https://www.llmfill.com`` 规范化后相等；
+    非默认端口（如 :8443）保留，代表不同 origin。
+    """
+    parts = urllib.parse.urlsplit(url or "")
+    host = (parts.hostname or "").lower()
+    port = parts.port
+    if port is None or (parts.scheme == "https" and port == 443) \
+            or (parts.scheme == "http" and port == 80):
+        return f"{parts.scheme}://{host}"
+    return f"{parts.scheme}://{host}:{port}"
+
+
 def is_default_base(url: str) -> bool:
-    """base_url 是否指向默认信任 origin（www.llmfill.com / llmfill.com）。"""
-    return (urllib.parse.urlsplit(url).hostname or "") in ALLOWED_HOSTS
+    """是否默认信任 origin：完整比较 scheme+host+端口（仅查 hostname 会漏掉换端口绕过）。"""
+    return normalize_origin(url) in DEFAULT_ALLOWED_ORIGINS
 
 
 def ensure_allowed_base(cfg: dict) -> None:
@@ -95,8 +111,8 @@ def ensure_allowed_base(cfg: dict) -> None:
     base = cfg.get("base_url") or DEFAULT_BASE_URL
     if is_default_base(base):
         return
-    approved = set(cfg.get("approved_origins") or [])
-    if base in approved:
+    approved = {normalize_origin(x) for x in cfg.get("approved_origins") or []}
+    if normalize_origin(base) in approved:
         return
     raise ConfigError(
         f"自定义服务端点 {base} 未获批准。默认仅允许 https://www.llmfill.com。\n"
@@ -123,7 +139,8 @@ def load_config(*, require: bool = True, check_approval: bool = True) -> dict:
     cfg: dict = {}
     if CONFIG_PATH.exists():
         try:
-            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            # utf-8-sig 兼容带 BOM 的配置（Windows 记事本 / PowerShell Set-Content 默认带 BOM）
+            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
         except (ValueError, OSError) as exc:
             raise ConfigError(f"配置文件损坏（{CONFIG_PATH}）：{exc}\n请重新运行 llmfill config") from exc
         if not isinstance(cfg, dict):

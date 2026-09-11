@@ -28,6 +28,13 @@ class _FakeStdin:
         return False
 
 
+class _TtyStdin:
+    """模拟交互 stdin（isatty=True），配合 mock getpass 测试交互输入。"""
+
+    def isatty(self):
+        return True
+
+
 # ---------------------------------------------------------------------------
 # config.py
 # ---------------------------------------------------------------------------
@@ -37,10 +44,10 @@ class TestConfig:
     def test_save_load_roundtrip(self, tmp_path, monkeypatch):
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "config.json")
         monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path)
-        config_mod.save_config({"base_url": "https://www.llmfill.com", "api_key": "aif_x"})
+        config_mod.save_config({"base_url": "https://www.llmfill.com", "api_key": "aif_xxxx1234"})
         cfg = config_mod.load_config()
         assert cfg["base_url"] == "https://www.llmfill.com"
-        assert cfg["api_key"] == "aif_x"
+        assert cfg["api_key"] == "aif_xxxx1234"
 
     def test_env_overrides_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "config.json")
@@ -64,9 +71,19 @@ class TestConfig:
         with pytest.raises(config_mod.ConfigError, match="损坏"):
             config_mod.load_config()
 
+    def test_load_config_tolerates_utf8_bom(self, tmp_path, monkeypatch):
+        """带 UTF-8 BOM 的配置（Windows 记事本/PowerShell 默认）应正常读取，不报损坏。"""
+        p = tmp_path / "config.json"
+        payload = json.dumps({"api_key": "aif_xxxx1234", "base_url": "https://www.llmfill.com"})
+        p.write_bytes(b"\xef\xbb\xbf" + payload.encode("utf-8"))
+        monkeypatch.setattr(config_mod, "CONFIG_PATH", p)
+        monkeypatch.delenv("LLMFILL_API_KEY", raising=False)
+        cfg = config_mod.load_config()
+        assert cfg["api_key"] == "aif_xxxx1234"
+
     def test_default_base_url(self, tmp_path, monkeypatch):
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "nonexistent.json")
-        monkeypatch.setenv("LLMFILL_API_KEY", "aif_x")
+        monkeypatch.setenv("LLMFILL_API_KEY", "aif_xxxx1234")
         cfg = config_mod.load_config()
         assert cfg["base_url"] == config_mod.DEFAULT_BASE_URL
 
@@ -98,7 +115,7 @@ class TestConfig:
 
     def test_load_config_rejects_bad_env_base(self, tmp_path, monkeypatch):
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "none.json")
-        monkeypatch.setenv("LLMFILL_API_KEY", "aif_x")
+        monkeypatch.setenv("LLMFILL_API_KEY", "aif_xxxx1234")
         monkeypatch.setenv("LLMFILL_BASE_URL", "http://evil.example.com")
         with pytest.raises(config_mod.ConfigError, match="HTTPS"):
             config_mod.load_config()
@@ -117,6 +134,21 @@ class TestConfig:
     def test_ensure_allowed_base_default_ok(self):
         config_mod.ensure_allowed_base({"base_url": "https://www.llmfill.com"})
         config_mod.ensure_allowed_base({"base_url": "https://llmfill.com"})
+        # 显式默认端口（:443）与省略等价
+        config_mod.ensure_allowed_base({"base_url": "https://www.llmfill.com:443"})
+
+    def test_nondefault_port_requires_approval(self):
+        """regression：非默认端口即使 host 在名单内也需批准（仅查 hostname 的绕过）。"""
+        with pytest.raises(config_mod.ConfigError, match="未获批准"):
+            config_mod.ensure_allowed_base({"base_url": "https://www.llmfill.com:8443"})
+        with pytest.raises(config_mod.ConfigError, match="未获批准"):
+            config_mod.ensure_allowed_base({"base_url": "https://llmfill.com:444"})
+
+    def test_normalize_origin_equivalence(self):
+        assert config_mod.normalize_origin("https://www.llmfill.com:443/x") == "https://www.llmfill.com"
+        assert config_mod.normalize_origin("https://WWW.LLMFill.com") == "https://www.llmfill.com"
+        assert config_mod.normalize_origin("https://www.llmfill.com:8443") == "https://www.llmfill.com:8443"
+        assert config_mod.normalize_origin("http://127.0.0.1:8000") == "http://127.0.0.1:8000"
 
     def test_ensure_allowed_base_custom_unapproved_raises(self):
         with pytest.raises(config_mod.ConfigError, match="未获批准"):
@@ -131,7 +163,7 @@ class TestConfig:
     def test_load_config_custom_env_unapproved_raises(self, tmp_path, monkeypatch):
         """LLMFILL_BASE_URL 单独不能授权自定义 origin（fail-closed）。"""
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "none.json")
-        monkeypatch.setenv("LLMFILL_API_KEY", "aif_x")
+        monkeypatch.setenv("LLMFILL_API_KEY", "aif_xxxx1234")
         monkeypatch.setenv("LLMFILL_BASE_URL", "https://private.example")
         with pytest.raises(config_mod.ConfigError, match="未获批准"):
             config_mod.load_config()
@@ -142,7 +174,7 @@ class TestConfig:
         monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path)
         config_mod.save_config({
             "base_url": "https://private.example",
-            "api_key": "aif_x",
+            "api_key": "aif_xxxx1234",
             "approved_origins": ["https://private.example"],
         })
         cfg = config_mod.load_config()
@@ -257,7 +289,7 @@ class TestRedirectHandler:
 
     def _req(self):
         return urllib.request.Request(
-            "https://www.llmfill.com/v1/x", headers={"X-Auth-Token": "aif_x"}
+            "https://www.llmfill.com/v1/x", headers={"X-Auth-Token": "aif_xxxx1234"}
         )
 
     def test_same_origin_allowed(self):
@@ -333,7 +365,7 @@ class TestDownloadResults:
             return Path(out_dir) / f"表单{suffix}"
 
         monkeypatch.setattr(llmfill, "download_file", fake_download)
-        cfg = {"base_url": "https://x", "api_key": "aif_x"}
+        cfg = {"base_url": "https://x", "api_key": "aif_xxxx1234"}
         targets = llmfill._download_batch_results(cfg, "b_1", Path(tmp_path))
         assert [t.name for t in targets] == ["表单_processed.docx", "表单_clean.docx"]
         assert calls == [
@@ -351,7 +383,7 @@ class TestDownloadResults:
             return Path(out_dir) / "表单_clean.docx"
 
         monkeypatch.setattr(llmfill, "download_file", fake_download)
-        cfg = {"base_url": "https://x", "api_key": "aif_x"}
+        cfg = {"base_url": "https://x", "api_key": "aif_xxxx1234"}
         targets = llmfill._download_batch_results(cfg, "b_1", Path(tmp_path), clean_only=True)
         assert [t.name for t in targets] == ["表单_clean.docx"]
         assert calls == ["/v1/documents/b_1/result?clean=true"]
@@ -361,7 +393,7 @@ class TestRequestJsonNetwork:
     def test_network_error(self):
         with pytest.raises(ApiError) as ei:
             api_client.request_json(
-                "http://127.0.0.1:1", "aif_x", "GET", "/v1/knowledge-bases", timeout=2
+                "http://127.0.0.1:1", "aif_xxxx1234", "GET", "/v1/knowledge-bases", timeout=2
             )
         assert ei.value.code == "NETWORK_ERROR"
 
@@ -390,7 +422,7 @@ class TestCli:
     def test_whoami_json(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
         monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path)
-        monkeypatch.setenv("LLMFILL_API_KEY", "aif_x")
+        monkeypatch.setenv("LLMFILL_API_KEY", "aif_xxxx1234")
         rc = self._run(["--json", "whoami"], monkeypatch, responses={
             ("GET", "/v1/account/whoami"): {"user_id": "u-1", "token_valid": True, "balance": 5.5},
         })
@@ -401,7 +433,7 @@ class TestCli:
 
     def test_fill_status_json(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
-        monkeypatch.setenv("LLMFILL_API_KEY", "aif_x")
+        monkeypatch.setenv("LLMFILL_API_KEY", "aif_xxxx1234")
         rc = self._run(["--json", "fill-status", "b_1"], monkeypatch, responses={
             ("GET", "/v1/documents/b_1/status"): {
                 "batch_id": "b_1", "status": "completed", "progress": 100,
@@ -415,7 +447,7 @@ class TestCli:
     def test_search_command_removed(self, tmp_path, monkeypatch):
         """search 子命令已移除（纯后端接口不暴露），argparse 报无效命令。"""
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
-        monkeypatch.setenv("LLMFILL_API_KEY", "aif_x")
+        monkeypatch.setenv("LLMFILL_API_KEY", "aif_xxxx1234")
         import llmfill
         with pytest.raises(SystemExit):
             llmfill.main(["search", "--kb", "k", "--query", "q"])
@@ -423,7 +455,7 @@ class TestCli:
     def test_kb_upload_polls_documents_parse_status(self, tmp_path, monkeypatch, capsys):
         """kb upload 通过文档列表 parse_status 轮询（网关不暴露 /tasks）。"""
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
-        monkeypatch.setenv("LLMFILL_API_KEY", "aif_x")
+        monkeypatch.setenv("LLMFILL_API_KEY", "aif_xxxx1234")
         import llmfill
 
         # 上传前列表为空；上传后文档出现，前两次 parsing、第三次 completed
@@ -453,7 +485,7 @@ class TestCli:
     def test_kb_upload_json_output(self, tmp_path, monkeypatch, capsys):
         """kb upload --json 应输出机器可读结果（修复：此前 JSON 模式无任何输出）。"""
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
-        monkeypatch.setenv("LLMFILL_API_KEY", "aif_x")
+        monkeypatch.setenv("LLMFILL_API_KEY", "aif_xxxx1234")
         import llmfill
 
         doc_lists = iter([
@@ -482,7 +514,7 @@ class TestCli:
     def test_kb_upload_failed_doc_reported(self, tmp_path, monkeypatch, capsys):
         """入库 parse_status=failed 时计入失败并汇总非零退出。"""
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
-        monkeypatch.setenv("LLMFILL_API_KEY", "aif_x")
+        monkeypatch.setenv("LLMFILL_API_KEY", "aif_xxxx1234")
         import llmfill
 
         doc_lists = iter([
@@ -506,7 +538,7 @@ class TestCli:
 
     def test_api_error_exit_code(self, tmp_path, monkeypatch):
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
-        monkeypatch.setenv("LLMFILL_API_KEY", "aif_x")
+        monkeypatch.setenv("LLMFILL_API_KEY", "aif_xxxx1234")
         rc = self._run(["whoami"], monkeypatch, responses={
             ("GET", "/v1/account/whoami"): ApiError("INVALID_TOKEN", "令牌无效", 401),
         })
@@ -521,7 +553,7 @@ class TestCli:
 
     def test_kb_ls_json(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
-        monkeypatch.setenv("LLMFILL_API_KEY", "aif_x")
+        monkeypatch.setenv("LLMFILL_API_KEY", "aif_xxxx1234")
         rc = self._run(["--json", "kb", "ls"], monkeypatch, responses={
             ("GET", "/v1/knowledge-bases"): {
                 "total": 1, "kbs": [{"kb_id": "kb-1", "name": "资料库", "document_count": 3}],
@@ -534,7 +566,7 @@ class TestCli:
     def test_kb_rm_requires_yes_noninteractive(self, tmp_path, monkeypatch, capsys):
         """非交互环境 kb rm 不加 --yes 应报 CONFIRM_REQUIRED，且不实际删除。"""
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
-        monkeypatch.setenv("LLMFILL_API_KEY", "aif_x")
+        monkeypatch.setenv("LLMFILL_API_KEY", "aif_xxxx1234")
         import llmfill
 
         calls = []
@@ -552,7 +584,7 @@ class TestCli:
 
     def test_kb_rm_with_yes_deletes(self, tmp_path, monkeypatch):
         monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
-        monkeypatch.setenv("LLMFILL_API_KEY", "aif_x")
+        monkeypatch.setenv("LLMFILL_API_KEY", "aif_xxxx1234")
         import llmfill
 
         calls = []
@@ -575,7 +607,7 @@ class TestCli:
         import llmfill
 
         monkeypatch.setattr(sys, "stdin", _FakeStdin())
-        rc = llmfill.main(["config", "--base", "https://private.example", "--token", "aif_x"])
+        rc = llmfill.main(["config", "--base", "https://private.example", "--token", "aif_xxxx1234"])
         capsys.readouterr()
         assert rc == 1
 
@@ -593,10 +625,160 @@ class TestCli:
         monkeypatch.setattr(sys, "stdin", _FakeStdin())
         rc = llmfill.main([
             "config", "--base", "https://private.example",
-            "--token", "aif_x", "--allow-custom",
+            "--token", "aif_xxxx1234", "--allow-custom",
         ])
         capsys.readouterr()
         assert rc == 0
         cfg = config_mod.load_config()
         assert cfg["base_url"] == "https://private.example"
         assert "https://private.example" in cfg["approved_origins"]
+
+    def test_config_token_env_reads_variable(self, tmp_path, monkeypatch, capsys):
+        """--token-env 从指定环境变量读取令牌（推荐方式，不进 shell 历史）。"""
+        monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.delenv("LLMFILL_API_KEY", raising=False)
+        monkeypatch.setenv("LLMFILL_API_TOKEN", "aif_from_env")
+        import llmfill
+
+        def fake_request(base, key, method, path, **kw):
+            assert key == "aif_from_env"
+            return {"user_id": "u-1", "balance": 1.0}
+
+        monkeypatch.setattr(llmfill, "request_json", fake_request)
+        monkeypatch.setattr(sys, "stdin", _FakeStdin())
+        rc = llmfill.main(["config", "--token-env", "LLMFILL_API_TOKEN"])
+        capsys.readouterr()
+        assert rc == 0
+        cfg = config_mod.load_config()
+        assert cfg["api_key"] == "aif_from_env"
+
+    def test_config_token_env_missing_raises(self, tmp_path, monkeypatch, capsys):
+        """--token-env 指向未设置的环境变量应报错，且令牌错误不落盘。"""
+        monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.delenv("LLMFILL_API_KEY", raising=False)
+        monkeypatch.delenv("NOPE_TOKEN", raising=False)
+        import llmfill
+
+        monkeypatch.setattr(sys, "stdin", _FakeStdin())
+        rc = llmfill.main(["config", "--token-env", "NOPE_TOKEN"])
+        capsys.readouterr()
+        assert rc == 1
+
+    def test_config_token_env_rejects_non_allowlisted(self, tmp_path, monkeypatch, capsys):
+        """--token-env 拒绝白名单外的变量名：防止误读无关服务的密钥。"""
+        monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.delenv("LLMFILL_API_KEY", raising=False)
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_不是llmfill令牌")
+        import llmfill
+
+        monkeypatch.setattr(sys, "stdin", _FakeStdin())
+        rc = llmfill.main(["config", "--token-env", "GITHUB_TOKEN"])
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "仅允许" in captured.out + captured.err
+        # 白名单外变量即使设置了也绝不能被读取/落盘
+        assert not (tmp_path / "c.json").exists()
+
+    def test_config_token_env_mask_placeholder_hint(self, tmp_path, monkeypatch, capsys):
+        """--token-env 收到掩码占位符（secret 未注入）时给出针对性提示。"""
+        monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.delenv("LLMFILL_API_KEY", raising=False)
+        monkeypatch.setenv("LLMFILL_API_TOKEN", "***")
+        import llmfill
+
+        monkeypatch.setattr(sys, "stdin", _FakeStdin())
+        rc = llmfill.main(["config", "--token-env", "LLMFILL_API_TOKEN"])
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "掩码" in captured.out + captured.err
+        assert not (tmp_path / "c.json").exists()
+
+    def test_config_token_env_secret_ref_hint(self, tmp_path, monkeypatch, capsys):
+        """--token-env 收到 secret 引用串（store:LLMFILL_API_TOKEN）时给出针对性提示。"""
+        monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.delenv("LLMFILL_API_KEY", raising=False)
+        monkeypatch.setenv("LLMFILL_API_TOKEN", "store:LLMFILL_API_TOKEN")
+        import llmfill
+
+        monkeypatch.setattr(sys, "stdin", _FakeStdin())
+        rc = llmfill.main(["config", "--token-env", "LLMFILL_API_TOKEN"])
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "引用" in captured.out + captured.err
+        assert not (tmp_path / "c.json").exists()
+
+    def test_config_token_env_rejects_wrong_format(self, tmp_path, monkeypatch, capsys):
+        """--token-env 的值不是 aif_ 格式时拒绝，不保存也不发送。"""
+        monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.delenv("LLMFILL_API_KEY", raising=False)
+        monkeypatch.setenv("LLMFILL_API_TOKEN", "ghp_误指向的无关密钥")
+        import llmfill
+
+        called = []
+
+        def fake_request(*a, **kw):
+            called.append(a)
+            return {}
+
+        monkeypatch.setattr(llmfill, "request_json", fake_request)
+        monkeypatch.setattr(sys, "stdin", _FakeStdin())
+        rc = llmfill.main(["config", "--token-env", "LLMFILL_API_TOKEN"])
+        captured = capsys.readouterr()
+        assert rc == 1
+        # 格式错误：不发起远程请求、不落盘、错误信息不回显令牌值
+        assert not called
+        assert not (tmp_path / "c.json").exists()
+        assert "ghp_误指向的无关密钥" not in captured.out + captured.err
+
+    def test_config_verify_fail_does_not_persist_new_token(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """新令牌远程验证失败时不落盘（fail-closed），旧令牌仍保留。"""
+        monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.delenv("LLMFILL_API_KEY", raising=False)
+        import llmfill
+        from api_client import ApiError
+
+        config_mod.save_config({"api_key": "aif_old_token_1"})
+
+        def fake_request(base, key, method, path, **kw):
+            raise ApiError("INVALID_TOKEN", "令牌无效")
+
+        monkeypatch.setattr(llmfill, "request_json", fake_request)
+        monkeypatch.setattr(sys, "stdin", _FakeStdin())
+        rc = llmfill.main(["config", "--token", "aif_bad_but_format_ok"])
+        captured = capsys.readouterr()
+        assert rc == 0  # 验证失败是结果输出（ok 消息），不是崩溃
+        assert "未写入" in captured.out + captured.err
+        cfg = config_mod.load_config(require=False, check_approval=False)
+        # 候选新令牌未持久化，存量旧令牌不被覆盖
+        assert cfg["api_key"] == "aif_old_token_1"
+
+    def test_config_interactive_getpass_no_echo(self, tmp_path, monkeypatch, capsys):
+        """交互输入走 getpass（不回显）：令牌值不得出现在任何输出。"""
+        monkeypatch.setattr(config_mod, "CONFIG_PATH", tmp_path / "c.json")
+        monkeypatch.setattr(config_mod, "CONFIG_DIR", tmp_path)
+        monkeypatch.delenv("LLMFILL_API_KEY", raising=False)
+        import llmfill
+
+        monkeypatch.setattr(sys, "stdin", _TtyStdin())
+        monkeypatch.setattr(llmfill.getpass, "getpass", lambda *a, **k: "aif_secret")
+
+        def fake_request(base, key, method, path, **kw):
+            return {"user_id": "u-1"}
+
+        monkeypatch.setattr(llmfill, "request_json", fake_request)
+        rc = llmfill.main(["config"])
+        captured = capsys.readouterr()
+        assert rc == 0
+        # 令牌明文不得回显到 stdout/stderr（防录屏/会话日志截获）
+        assert "aif_secret" not in captured.out + captured.err
+        cfg = config_mod.load_config()
+        assert cfg["api_key"] == "aif_secret"

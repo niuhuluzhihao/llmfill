@@ -44,6 +44,11 @@
 
 `document_id` 从文档列表获取。
 
+> ⚠️ **删除不可恢复**：`DELETE /v1/knowledge-bases/{kb_id}/files/{document_id}`
+> 会**同时删除原文件与已解析的全部向量/索引数据**，且无软删除、无回收站，
+> 无法恢复。删除前请确认本机留有源文件副本（必要时先用 download 接口导出）；
+> CLI 侧 `llmfill kb rm` 会要求交互确认或显式 `--yes`，直接调 API 则没有这层保护。
+
 ## 与填写的配合
 
 知识库建好后，`fill --kb <kb_id>` 挂载给文档填写使用（服务端在

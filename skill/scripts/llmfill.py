@@ -22,7 +22,10 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -149,6 +152,64 @@ def _approve_custom_base(cfg: dict, base_url: str, allow_custom: bool) -> None:
     )
 
 
+# --token-env 仅允许的变量名：不接受任意环境变量，防止误把其它服务的
+# 密钥（云/CI/源码库凭据）当作 LLMFill 令牌读走、落盘并外发
+TOKEN_ENV_ALLOWLIST = ("LLMFILL_API_TOKEN", "LLMFILL_API_KEY")
+
+# 令牌格式：aif_ 前缀 + 限定字符集/长度（与个人中心「API 密钥」生成的格式一致）
+_TOKEN_RE = re.compile(r"^aif_[A-Za-z0-9_-]{4,196}$")
+
+
+def _validate_token(value: str, source: str) -> str:
+    """校验令牌格式（aif_ 前缀 + 字符集/长度），值不匹配时 fail-closed。
+
+    目的：环境变量/参数指错时（如指向 GITHUB_TOKEN 等无关密钥）在保存与
+    发送之前就拦下，不把无关密钥写进 config.json 或发给服务端。
+
+    额外诊断：agent 环境的常见坑是 secret 存进 store 后对模型隐藏，往 env
+    里传时拿到的是掩码占位符（如 ``***``），而非真实令牌。此时给出针对性
+    提示，避免用户误以为「上传的令牌错了」。
+    错误信息只描述格式/长度问题，绝不回显真实令牌值。
+    """
+    v = value.strip()
+    if _TOKEN_RE.match(v):
+        return v
+    if not v:
+        raise ApiError("CONFIG_REQUIRED", f"{source} 未取到令牌值（空）。")
+    if "*" in v or v.lower() in ("your_token_here", "<token>"):
+        # 收到掩码/占位符：几乎可以断定是 secret 未注入环境变量
+        raise ApiError(
+            "CONFIG_REQUIRED",
+            f"{source} 收到的是掩码占位符（含 ``*``），不是真实令牌——说明 secret "
+            "未真正注入到环境变量（agent 环境常见：secrets 存的值对模型隐藏）。"
+            "请改为让用户本人运行 `python scripts/llmfill.py config` 交互式输入，"
+            "或直接把令牌写入 ~/.llmfill/config.json 的 api_key 字段。",
+        )
+    # secret 引用/占位：agent 平台往本地 exec 的 env 传 secret 时，拿到的常是
+    # `store:LLMFILL_API_TOKEN` 这类引用串，而非真实值。真实令牌（aif_+安全字符）
+    # 绝不含冒号/尖括号/花括号，故凡含这些即可断定是「引用未展开」。
+    if ":" in v or v[0] in "<{":
+        raise ApiError(
+            "CONFIG_REQUIRED",
+            f"{source} 收到的是 secret 引用/占位符（{v[:24]!r}...），不是真实令牌——"
+            "agent 平台的 secrets 不会注入到本地脚本的环境变量。"
+            "请改为让用户本人运行 `python scripts/llmfill.py config` 交互式输入，"
+            "或直接把令牌写入 ~/.llmfill/config.json 的 api_key 字段。",
+        )
+    if not v.startswith("aif_"):
+        raise ApiError(
+            "CONFIG_REQUIRED",
+            f"{source} 的值不是 aif_ 开头的令牌（当前收到 {len(v)} 个字符）。"
+            "可能误指向了其它服务的密钥变量，或 secret 未注入；"
+            "请用专用变量 LLMFILL_API_TOKEN。",
+        )
+    raise ApiError(
+        "CONFIG_REQUIRED",
+        f"{source} 的值以 aif_ 开头，但含非法字符或长度不符（共 {len(v)} 个字符）。"
+        "请重新从个人中心完整复制令牌。",
+    )
+
+
 def cmd_config(args, out: Output) -> None:
     """首次配置：只填 API Key（base_url 内置默认，改 JSON/env 可覆盖）。"""
     cfg = load_config(require=False, check_approval=False)
@@ -161,40 +222,74 @@ def cmd_config(args, out: Output) -> None:
     )
     if not is_default_base(base_url):
         _approve_custom_base(cfg, base_url, args.allow_custom)
-    api_key = args.token or cfg.get("api_key") or ""
+    # 令牌来源优先级：--token-env（推荐，不进 shell 历史）> --token（兼容保留）
+    # > 交互输入（getpass 不回显）> 存量配置；新输入的令牌先做格式校验
+    api_key = ""
+    new_token = False  # 本次是否输入了新令牌（决定验证失败时是否保留旧值）
+    if args.token_env:
+        # 从环境变量读令牌：不进 shell 历史/进程列表，终端也不回显。
+        # 仅允许专用变量名，防止误读无关密钥（对应审计 T09）
+        if args.token_env not in TOKEN_ENV_ALLOWLIST:
+            raise ApiError(
+                "CONFIG_REQUIRED",
+                f"--token-env 仅允许 {TOKEN_ENV_ALLOWLIST[0]}（推荐）或 "
+                f"{TOKEN_ENV_ALLOWLIST[1]}，不接受任意环境变量——防止误把其它服务的"
+                "密钥存入配置并发送给服务端。",
+            )
+        api_key = os.environ.get(args.token_env, "").strip()
+        if not api_key:
+            raise ApiError(
+                "CONFIG_REQUIRED", f"环境变量 {args.token_env} 未设置或为空"
+            )
+        api_key = _validate_token(api_key, f"环境变量 {args.token_env}")
+        new_token = True
+    elif args.token:
+        api_key = _validate_token(args.token, "--token")
+        new_token = True
+    elif sys.stdin.isatty():
+        # 交互输入用 getpass（不回显）：防旁观/录屏/会话日志截获长效令牌
+        try:
+            print("  API Key：前往 https://www.llmfill.com/profile 个人中心「API 密钥」")
+            print("  创建令牌后，粘贴 aif_ 开头的字符串（输入不回显；直接回车保留已存令牌）：")
+            entered = getpass.getpass("  API Key: ").strip()
+            if entered:
+                api_key = _validate_token(entered, "交互输入")
+                new_token = True
+        except (EOFError, KeyboardInterrupt):
+            raise ApiError(
+                "CONFIG_REQUIRED", "交互输入不可用：请用 --token-env 或 --token 配置"
+            )
 
-    if not args.token:
-        # 未显式传 key：交互式可输入或回车保留存量；非交互时要求已有存量
-        if sys.stdin.isatty():
-            try:
-                hint = f"（回车保留 {api_key[:12]}…）" if api_key else ""
-                print("  API Key：前往 https://www.llmfill.com/profile 个人中心「API 密钥」")
-                print(f"  创建令牌后，粘贴 aif_ 开头的字符串{hint}：")
-                entered = input("  API Key: ").strip()
-                if entered:
-                    api_key = entered
-            except (EOFError, KeyboardInterrupt):
-                raise ApiError("CONFIG_REQUIRED", "交互输入不可用：请用 --token 参数配置")
-        elif not api_key:
-            raise ApiError("CONFIG_REQUIRED", "非交互环境请用 --token 参数配置")
-
+    api_key = api_key or cfg.get("api_key") or ""
     if not api_key:
-        raise ApiError("CONFIG_REQUIRED", "缺少 API Key（--token 或交互输入）")
+        raise ApiError("CONFIG_REQUIRED", "缺少 API Key（--token-env / --token 或交互输入）")
 
-    cfg.update({"base_url": base_url, "api_key": api_key})
-    path = save_config(cfg)
-
-    # 自检
+    # 先远程验证，通过后才把候选令牌落盘（对应审计 T09：验证失败不持久化新凭据）
+    old_stored = cfg.get("api_key")
     try:
         whoami = request_json(base_url, api_key, "GET", "/v1/account/whoami")
     except ApiError as exc:
-        out.result({"saved": str(path), "verified": False, "error": str(exc)},
-                   ok=f"已保存到 {path}，但自检失败：{exc}")
+        if new_token:
+            # 新令牌验证失败：不保存该候选值，恢复存量旧令牌
+            # （自定义端点批准结果仍保留，便于重试）
+            cfg["base_url"] = base_url
+            if old_stored:
+                cfg["api_key"] = old_stored
+            else:
+                cfg.pop("api_key", None)
+            path = save_config(cfg)
+            out.result({"saved": str(path), "verified": False, "error": str(exc)},
+                       ok=f"令牌验证失败，未写入 {path}：{exc}")
+        else:
+            cfg.update({"base_url": base_url, "api_key": api_key})
+            path = save_config(cfg)
+            out.result({"saved": str(path), "verified": False, "error": str(exc)},
+                       ok=f"已保存到 {path}，但自检失败：{exc}")
         return
 
     user_id = whoami.get("user_id")
-    cfg["user_id"] = user_id
-    save_config(cfg)
+    cfg.update({"base_url": base_url, "api_key": api_key, "user_id": user_id})
+    path = save_config(cfg)
     balance = whoami.get("balance")
     bal_txt = f"，余额 {balance}" if balance is not None else ""
     identity = _identity_text(whoami)
@@ -509,7 +604,10 @@ def build_parser() -> argparse.ArgumentParser:
     # config
     p = sub.add_parser("config", help="首次配置（API Key + Base URL）并自检")
     p.add_argument("--base", help="覆盖服务地址（默认内置 www.llmfill.com；自定义地址需 --allow-custom）")
-    p.add_argument("--token", help="API Key（aif_ 开头）")
+    p.add_argument("--token-env", metavar="NAME",
+                   help="从环境变量读取 API Key，仅允许 LLMFILL_API_TOKEN / "
+                        "LLMFILL_API_KEY（推荐：不进 shell 历史、终端不回显）")
+    p.add_argument("--token", help="API Key 明文参数（会留在 shell 历史，建议改用 --token-env）")
     p.add_argument("--allow-custom", action="store_true", help="批准非默认的自定义服务地址（自建/代理部署）")
     p.set_defaults(func=cmd_config)
 

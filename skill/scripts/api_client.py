@@ -23,6 +23,8 @@ import uuid
 from pathlib import Path
 from typing import Iterable
 
+from config import normalize_origin
+
 
 class ApiError(Exception):
     """API 调用失败（非 2xx 或网络异常），携带统一错误码。"""
@@ -34,26 +36,17 @@ class ApiError(Exception):
         self.status = status
 
 
-def _origin(url: str) -> str:
-    """规范化 origin：``scheme://host[:port]``，端口缺省按 scheme 补默认。"""
-    parts = urllib.parse.urlsplit(url)
-    host = parts.hostname or ""
-    port = parts.port
-    if port is None:
-        port = 443 if parts.scheme == "https" else 80
-    return f"{parts.scheme}://{host}:{port}"
-
-
 class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
     """仅允许同 origin 重定向；跨域/降级一律拒绝，防 X-Auth-Token 泄露到第三方。
 
     urllib 默认会把原请求头（含 X-Auth-Token）转发到重定向目标，跨域即泄露凭据。
-    此处比较规范化 origin，不同则抛 HTTPError 终止，绝不转发认证头。
+    此处用与配置校验同一套 normalize_origin 比较，不同则抛 HTTPError 终止，
+    绝不转发认证头。
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        old = _origin(req.full_url)
-        new = _origin(newurl)
+        old = normalize_origin(req.full_url)
+        new = normalize_origin(newurl)
         if old != new:
             raise urllib.error.HTTPError(
                 req.full_url, code,
